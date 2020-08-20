@@ -1,0 +1,399 @@
+#!/usr/bin/python3
+
+import subprocess
+import json
+import re
+import os
+import sys
+import yaml
+from pathlib import Path
+from tkinter import Tk, Frame, Canvas, W, E, N, S, BOTH
+
+class Workspace:
+    def __init__(self, name, num, focused, windows):
+        self.name = name
+        self.num = num
+        self.focused = focused
+        self.windows = windows
+        self.pos = None
+
+class Grid:
+    def __init__(self, rect, workspaces, is_expanded):
+        self.rect_size_pct = 4
+        
+        self.width = rect['width']
+        self.height = rect['height']
+        self.x = rect['x']
+        self.y = rect['y']
+        
+        self.rect_size = self.rect_size_pct*self.height/100
+        
+        if is_expanded:
+            self.display_size = 3*self.rect_size
+        else:
+            self.display_size = 2*self.rect_size
+        
+        self.workspaces = workspaces
+        
+    def make_frame(self):
+        root = Tk()
+
+        root.attributes('-type', 'dialog')
+        root.wm_attributes("-alpha", 0.5)
+        root.overrideredirect(1)
+
+        screen_middle = (self.width/2 + self.x - self.display_size/2,
+                         self.height/2 + self.y - self.display_size/2)
+
+        root.geometry("+%d+%d" % screen_middle)
+        root.after(500, lambda: root.destroy())
+        
+        frame = Frame(root)
+        frame.columnconfigure(0,weight=1)
+        frame.rowconfigure(0,weight=1)
+
+        return frame
+
+    def kill_competing(self):
+        processes = subprocess.check_output(['ps', '-ax']).decode('utf-8')
+        process_name = sys.argv[0]
+        grids = re.findall(f'(\d+) \?.*?{process_name}', processes)
+        pids = [int(p) for p in grids]
+        
+        if len(pids) > 0:
+            keep = max(pids)
+
+            for pid in [p for p in pids if p != keep]:
+                os.kill(int(pid), 9)
+                
+    def display(self):
+        def draw_workspace(canvas, w):
+            def rect_coords(y, x):
+                return [c*self.rect_size for c in [x, y, x+1, y+1]]
+
+            color = 'gray20' if w.focused else 'gray'
+            
+            coords = rect_coords(*w.pos)
+            canvas.create_rectangle(coords, fill=color, outline='')
+        
+        frame = self.make_frame()
+
+        canvas = Canvas(
+            frame,
+             bd=0,
+             width=self.display_size,
+             height=self.display_size,
+             highlightthickness=0)
+
+        for w in self.workspaces:
+            draw_workspace(canvas, w)
+
+        canvas.grid(row=0, sticky=W+E+N+S)
+        frame.pack(fill=BOTH, expand=1)
+
+        self.kill_competing()
+        frame.mainloop()
+    
+class Output:
+    def __init__(self, output_id, prefix, name, rect, workspaces):
+        self.canonical = {1, 2, 4, 5}
+        self.rows = 3
+        self.cols = 3
+        
+        self.id = output_id
+        self.prefix = prefix
+        self.name = name
+        self.rect = rect
+        
+        self.workspaces = workspaces
+        self.fix_workspaces()
+    
+    def workspace_numbers(self):
+        return set([w.num for w in self.workspaces])
+    
+    def fix_workspaces(self):
+        def get_pos(w):
+            return ((w.num-1)//self.rows, (w.num-1)%self.cols)
+        
+        existing_nums = set(self.workspace_numbers())
+        existing_names = set([w.name for w in self.workspaces])
+
+        for w in self.workspaces:
+            expected_num = w.num
+            
+            if w.num is None or w.num > 9:
+                available_nums = self.canonical - existing_nums
+                
+                if len(available_nums) == 0:
+                    available_nums = set(range(1,10)) - existing_nums
+                
+                if len(available_nums) > 0:
+                    expected_num = min(available_nums)
+                else:
+                    expected_num = min([n for n in existing_nums if n in all_nums])
+            
+            expected_name = self.workspace_name(expected_num)
+  
+            if w.name != expected_name:
+                if expected_name in existing_names:
+                    self.move_all_windows(w, expected_name)
+                else:
+                    self.rename(w.name, expected_name)
+            
+            w.pos = get_pos(w)
+            
+            if w.focused:
+                self.focused = w
+    
+    def move_all_windows(self, w, dest):
+        for window in w.windows:
+            os.system(f'i3-msg [con_id={window["id"]}] move to workspace {dest}')
+        if w.focused:
+            self.focus(dest)
+    
+    def rename(self, old_name, new_name):
+        os.system(f'i3-msg rename workspace {old_name} to {new_name}')
+    
+    def workspace_name(self, number):
+        return f"{self.prefix}{number}:{number}"
+
+    def is_grid_expanded(self):
+        return set(self.workspace_numbers()) - self.canonical
+        
+    def valid_focus(self, w):
+        return w in self.canonical or self.is_grid_expanded()
+    
+    def move_to(self, workspace):
+        os.system(f'i3-msg move container to workspace {workspace}')
+        self.focus(workspace)
+    
+    def focus(self, workspace):
+        os.system(f'i3-msg workspace {workspace}')
+    
+    def next_workspace(self, command):
+        def direction_number(direction):
+            i, j = self.focused.pos
+
+            if direction == 'up':
+                i -= 1
+            elif direction == 'down':
+                i += 1
+            elif direction == 'left':
+                j -= 1
+            elif direction == 'right':
+                j += 1
+
+            i = min(max(i, 0), self.rows-1)
+            j = min(max(j, 0), self.cols-1)
+
+            return j+(i*self.cols)+1
+        
+        if command.isdigit():
+            num = int(command)
+        else:
+            num = direction_number(command)
+        
+        return num
+    
+    def execute(self, mode, cmd):
+        number = self.next_workspace(cmd)
+        name = self.workspace_name(number)
+        
+        if mode == 'focus':
+            if self.valid_focus(number):
+                self.focus(name)
+        elif mode == 'move':
+            self.move_to(name)
+    
+    def display_grid(self):
+        g = Grid(self.rect, self.workspaces, self.is_grid_expanded())
+        g.display()
+    
+    def __str__(self):
+        return f"(Output {self.name})"
+    
+    def __repr__(self):
+        return self.__str__()
+    
+class Manager:
+    def __init__(self):
+        self.outputs = []
+        self.update()
+
+    def config_file(self):
+        home_dir = Path(os.getenv('HOME'))
+
+        config_dir = home_dir / '.config/workspace_manager/'
+        config_dir.mkdir(parents=True, exist_ok=True)
+        config_file = config_dir / 'displays'
+
+        return config_file
+
+    def read_config(self):
+        config_file = self.config_file()
+
+        if config_file.exists():
+            with open(config_file, 'r') as f:
+               self.config = yaml.load(f, Loader=yaml.FullLoader)
+        else:
+            self.config = {}
+
+    def change_config(self, config):
+        self.read_config()
+
+        output = config[0]
+        args = config[1:]
+
+        self.config[output] = ' '.join(args)
+
+        config_file = self.config_file()
+        
+        with open(config_file, 'w') as f:
+            f.write(yaml.dump(self.config))
+
+        self.setup()
+
+    def setup_displays(self):
+        def get_output_names():
+            command = ['i3-msg', '-t', 'get_outputs']
+            sys_out = subprocess.check_output(command).decode('utf-8')
+            names = [o['name'] for o in json.loads(sys_out) if o['active']]
+            return set(names)
+        
+        output_names = get_output_names()
+        
+        outputs = subprocess.check_output('xrandr').decode('utf-8')
+        primary_output = re.findall('(\w+).*?primary', outputs)[0]
+        connected_outputs = set(re.findall('(\w+) connected', outputs))
+ 
+        deprecated_outputs = output_names - connected_outputs
+        new_outputs = connected_outputs - output_names
+
+        has_new_outputs = len(new_outputs) > 0
+        has_deprecated = len(deprecated_outputs) > 0
+        has_change = has_deprecated or has_new_outputs
+
+        if has_change:
+            if has_deprecated:
+                for o in deprecated_outputs:
+                    os.system(f'xrandr --output {o} --off')
+
+            if has_new_outputs:
+                command = 'xrandr '
+    
+                for o in new_outputs:
+                    if o in self.config:
+                      command += f' --output {o} {self.config[o]}'
+                    else:
+                      command += f' --output {o} --auto --left-of {primary_output}'
+    
+                os.system(command)
+            
+            os.system('nitrogen --restore')
+
+    def apply_config(self):
+        command = 'xrandr '
+        
+        for o in self.config:
+            command += f' --output {o} {self.config[o]}'
+
+        os.system(command)
+            
+    def update(self):
+        self.outputs = []
+        
+        command = ['i3-msg', '-t', 'get_tree']
+        sys_out = subprocess.check_output(command).decode('utf-8')
+        tree = json.loads(sys_out)
+
+        output_nodes = [o for o in tree['nodes'] if o['name'] != '__i3']
+
+        for i, o in enumerate(output_nodes, start=1):
+            content = [n for n in o['nodes'] if n['name'] == 'content'][0]
+            workspace_nodes = content['nodes']
+
+            workspaces = []
+            
+            output_focused = False
+
+            for w in workspace_nodes:
+                floating = [node for window in w['floating_nodes'] for node in window['nodes']]
+                windows = w['nodes'] + floating
+                window_ids = [window['id'] for window in windows]
+                
+                focused = w['focused'] or any([window['focused'] for window in windows])
+                output_focused = output_focused or focused
+                
+                _, _, num = w['name'].rpartition(':')
+                
+                if num.isdigit():
+                    num = int(num)
+                else:
+                    num = None
+                
+                workspaces.append(Workspace(w['name'], num, focused, windows))
+                
+            output = Output(o['id'], i, o['name'], o['rect'], workspaces)
+                
+            self.outputs.append(output)
+            
+            if output_focused:
+                self.active_output = output
+
+    def get_next_output(self):
+        current_index = self.outputs.index(self.active_output)
+        next_index = current_index - 1
+        
+        return self.outputs[next_index].name
+
+    def move_next(self):
+        next_output = self.get_next_output()
+        self.move_to(next_output)
+        self.focus(next_output)
+
+    def focus_next(self):
+        next_output = self.get_next_output()
+
+        self.focus(next_output)
+            
+    def move_to(self, output):
+        os.system(f'i3-msg move container to output {output}')
+        
+    def focus(self, output):
+        os.system(f'i3-msg focus output {output}')
+        
+    def setup(self):
+        os.system('xrandr --auto')
+        self.read_config()
+        self.setup_displays()
+        self.apply_config()
+        self.update()
+        os.system('nitrogen --restore')
+        
+    def execute(self, args):
+        try:
+            _, mode, cmd = args
+            
+            if mode in ['focus', 'move']:
+              if cmd in ['up', 'down', 'left', 'right'] or cmd.isdigit():
+                    self.active_output.execute(mode, cmd)
+              elif cmd == 'output':
+                    if mode == 'move':
+                         self.move_next()
+                    elif mode == 'focus':
+                        self.focus_next()
+            self.update()
+            self.active_output.display_grid()
+        except ValueError:
+            mode = args[1]
+            
+            if mode == 'setup':
+              self.setup()
+            elif mode == 'display':
+              self.update()
+            elif mode == 'config':
+              self.change_config(args[2:])
+            self.active_output.display_grid()
+        
+if __name__ == '__main__':
+    Manager().execute(sys.argv)
